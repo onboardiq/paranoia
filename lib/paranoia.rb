@@ -54,18 +54,24 @@ module Paranoia
 
   def paranoia_destroy
     transaction do
+      add_to_transaction
       run_callbacks(:destroy) do
+        raise ActiveRecord::ReadOnlyRecord, "#{self.class} is marked as readonly" if readonly?
+
         @_disable_counter_cache = deleted?
-        result = paranoia_delete
-        next result unless result && ActiveRecord::VERSION::STRING >= '4.2'
-        each_counter_cached_associations do |association|
-          foreign_key = association.reflection.foreign_key.to_sym
-          next if destroyed_by_association && destroyed_by_association.foreign_key.to_sym == foreign_key
-          next unless send(association.reflection.name)
-          association.decrement_counters
+        affected_rows = paranoia_destroy_row
+
+        next self unless ActiveRecord::VERSION::STRING >= '4.2'
+        if affected_rows > 0
+          each_counter_cached_associations do |association|
+            foreign_key = association.reflection.foreign_key.to_sym
+            next if destroyed_by_association && destroyed_by_association.foreign_key.to_sym == foreign_key
+            next unless send(association.reflection.name)
+            association.decrement_counters
+          end
         end
         @_disable_counter_cache = false
-        result
+        self
       end
     end
   end
@@ -78,14 +84,11 @@ module Paranoia
 
   def paranoia_delete
     raise ActiveRecord::ReadOnlyRecord, "#{self.class} is marked as readonly" if readonly?
-    if persisted?
-      # if a transaction exists, add the record so that after_commit
-      # callbacks can be run
-      add_to_transaction
-      update_columns(paranoia_destroy_attributes)
-    elsif !frozen?
-      assign_attributes(paranoia_destroy_attributes)
-    end
+
+    # if a transaction exists, add the record so that after_commit
+    # callbacks can be run
+    add_to_transaction if persisted?
+    paranoia_destroy_row
     self
   end
   alias_method :delete, :paranoia_delete
@@ -221,6 +224,33 @@ module Paranoia
     end
 
     clear_association_cache if destroyed_associations.present?
+  end
+
+  def paranoia_destroy_row
+    attributes = paranoia_destroy_attributes
+
+    if persisted?
+      model = self.class
+      primary_key = model.primary_key
+      affected_records = model
+                         .unscoped
+                         .without_deleted
+                         .where(primary_key => self[primary_key])
+                         .update_all(attributes)
+
+      if affected_records > 0
+        attributes.each do |k, v|
+          raw_write_attribute(k, v)
+        end
+      end
+
+      affected_records
+    elsif !frozen?
+      assign_attributes(attributes)
+      1
+    else
+      0
+    end
   end
 end
 
